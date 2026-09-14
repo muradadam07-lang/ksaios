@@ -76,10 +76,48 @@ async function dbFindKeyById(id) {
   return null;
 }
 
+async function dbCheckKeyGlobal(keyStr) {
+  if (!keyStr) return null;
+  const target = keyStr.trim().toUpperCase();
+  try {
+    const res = await fetch(`${SB_REST_URL}/license_keys?key=ilike.${encodeURIComponent(target)}&limit=1`, {
+      headers: { ...sbHeaders }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) return data[0];
+    }
+  } catch (e) {
+    console.error('dbCheckKeyGlobal error:', e.message);
+  }
+  return null;
+}
+
+async function dbUpdateKeyById(id, patchObj) {
+  if (!id) throw new Error('Key ID is required for update');
+  const res = await fetch(`${SB_REST_URL}/license_keys?id=eq.${encodeURIComponent(id)}&for_who=eq.${encodeURIComponent(FOR_WHO)}`, {
+    method: 'PATCH',
+    headers: { ...sbHeaders, 'Prefer': 'return=representation' },
+    body: JSON.stringify(patchObj)
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Supabase update error (${res.status}): ${errText}`);
+  }
+  const data = await res.json();
+  return Array.isArray(data) && data.length > 0 ? data[0] : null;
+}
+
 async function dbSaveKey(keyObj) {
-  const res = await fetch(`${SB_REST_URL}/license_keys`, {
-    method: 'POST',
-    headers: { ...sbHeaders, 'Prefer': 'return=representation,resolution=merge-duplicates' },
+  if (keyObj && keyObj.id !== undefined && keyObj.id !== null) {
+    // Exact update by row ID — never touches any other record
+    return await dbUpdateKeyById(keyObj.id, keyObj);
+  }
+  // Fallback update by key and for_who
+  const target = (keyObj.key || '').trim();
+  const res = await fetch(`${SB_REST_URL}/license_keys?key=ilike.${encodeURIComponent(target)}&for_who=eq.${encodeURIComponent(FOR_WHO)}`, {
+    method: 'PATCH',
+    headers: { ...sbHeaders, 'Prefer': 'return=representation' },
     body: JSON.stringify(keyObj)
   });
   if (!res.ok) {
@@ -89,9 +127,10 @@ async function dbSaveKey(keyObj) {
 }
 
 async function dbInsertKeys(newKeys) {
+  // Pure INSERT without resolution=merge-duplicates so existing rows are NEVER updated or overwritten
   const res = await fetch(`${SB_REST_URL}/license_keys`, {
     method: 'POST',
-    headers: { ...sbHeaders, 'Prefer': 'return=representation,resolution=merge-duplicates' },
+    headers: { ...sbHeaders, 'Prefer': 'return=representation' },
     body: JSON.stringify(newKeys)
   });
   if (!res.ok) {
@@ -524,7 +563,13 @@ app.post('/api/admin/generate', authMiddleware, async (req, res) => {
     const { count = 1, duration_days = 30, prefix = 'VIP', note = '' } = req.body;
     const newKeys = [];
     for (let i = 0; i < count; i++) {
-      const keyStr = generateRandomKey(prefix);
+      let keyStr = generateRandomKey(prefix);
+      // Guarantee key does not exist globally in the database
+      let attempts = 0;
+      while ((await dbCheckKeyGlobal(keyStr)) && attempts < 10) {
+        keyStr = generateRandomKey(prefix);
+        attempts++;
+      }
       const isLifetime = parseInt(duration_days) === 0;
       const keyItem = {
         key: keyStr,
@@ -553,9 +598,16 @@ app.post('/api/admin/add-custom', authMiddleware, async (req, res) => {
     const { key, duration_days = 30, note = '' } = req.body;
     if (!key || !key.trim()) return res.json({ status: 'error', message: 'Key text is required.' });
     const keyStr = key.trim().toUpperCase();
-    const existing = await dbFindKey(keyStr);
-    if (existing)
-      return res.json({ status: 'error', message: 'Key already exists.' });
+
+    // Check if key already exists globally anywhere in the database (regardless of for_who)
+    const existing = await dbCheckKeyGlobal(keyStr);
+    if (existing) {
+      return res.json({ 
+        status: 'error', 
+        message: `Key "${keyStr}" already exists in database (under for_who: ${existing.for_who || 'other'}). Duplicate key names cannot be reused.` 
+      });
+    }
+
     const isLifetime = parseInt(duration_days) === 0;
     const keyItem = {
       key: keyStr,
@@ -576,65 +628,83 @@ app.post('/api/admin/add-custom', authMiddleware, async (req, res) => {
   }
 });
 
-// Edit key (duration / note / expiry)
+// Edit key (duration / note / expiry) — applies by unique ID
 app.post('/api/admin/edit', authMiddleware, async (req, res) => {
   try {
-    const { key, duration_days, note, expires_at } = req.body;
-    const keyObj = await dbFindKey(key);
+    const { id, key, duration_days, note, expires_at } = req.body;
+    let keyObj = null;
+    if (id !== undefined && id !== null && String(id).trim() !== '') {
+      keyObj = await dbFindKeyById(id);
+    } else if (key) {
+      keyObj = await dbFindKey(key);
+    }
+
     if (!keyObj) return res.json({ status: 'error', message: 'Key not found.' });
     if (keyObj.for_who && keyObj.for_who !== FOR_WHO) return res.json({ status: 'error', message: 'Access denied.' });
 
+    const patch = {};
     if (duration_days !== undefined) {
       const days = parseInt(duration_days);
-      keyObj.duration_days = days;
-      keyObj.type = days === 0 ? 'lifetime' : `${days}d`;
+      patch.duration_days = days;
+      patch.type = days === 0 ? 'lifetime' : `${days}d`;
       if (days === 0) {
-        keyObj.expires_at = null;
+        patch.expires_at = null;
       } else if (keyObj.bound_hwid) {
-        // Already activated — recalculate from now
-        keyObj.expires_at = new Date(Date.now() + days * 86400000).toISOString();
+        patch.expires_at = new Date(Date.now() + days * 86400000).toISOString();
       } else {
-        keyObj.expires_at = null; // Will be set on first use
+        patch.expires_at = null;
       }
     }
     if (expires_at !== undefined) {
-      keyObj.expires_at = expires_at ? new Date(expires_at).toISOString() : null;
+      patch.expires_at = expires_at ? new Date(expires_at).toISOString() : null;
     }
-    if (note !== undefined) keyObj.note = note;
+    if (note !== undefined) patch.note = note;
 
-    await dbSaveKey(keyObj);
-    return res.json({ status: 'success', key: keyObj });
+    const updated = await dbUpdateKeyById(keyObj.id, patch);
+    return res.json({ status: 'success', key: updated || keyObj });
   } catch (err) {
     return res.json({ status: 'error', message: err.message });
   }
 });
 
-// Reset HWID
+// Reset HWID — applies by unique ID
 app.post('/api/admin/reset-hwid', authMiddleware, async (req, res) => {
   try {
-    const { key } = req.body;
-    const keyObj = await dbFindKey(key);
+    const { id, key } = req.body;
+    let keyObj = null;
+    if (id !== undefined && id !== null && String(id).trim() !== '') {
+      keyObj = await dbFindKeyById(id);
+    } else if (key) {
+      keyObj = await dbFindKey(key);
+    }
+
     if (!keyObj) return res.json({ status: 'error', message: 'Key not found.' });
     if (keyObj.for_who && keyObj.for_who !== FOR_WHO) return res.json({ status: 'error', message: 'Access denied.' });
-    keyObj.bound_hwid = null;
-    keyObj.device_name = null;
-    await dbSaveKey(keyObj);
-    return res.json({ status: 'success', message: `HWID reset for ${keyObj.key}` });
+
+    await dbUpdateKeyById(keyObj.id, { bound_hwid: null, device_name: null });
+    return res.json({ status: 'success', message: `HWID reset for ${keyObj.key} (ID: ${keyObj.id})` });
   } catch (err) {
     return res.json({ status: 'error', message: err.message });
   }
 });
 
-// Toggle enable/disable
+// Toggle enable/disable — applies by unique ID
 app.post('/api/admin/toggle', authMiddleware, async (req, res) => {
   try {
-    const { key } = req.body;
-    const keyObj = await dbFindKey(key);
+    const { id, key } = req.body;
+    let keyObj = null;
+    if (id !== undefined && id !== null && String(id).trim() !== '') {
+      keyObj = await dbFindKeyById(id);
+    } else if (key) {
+      keyObj = await dbFindKey(key);
+    }
+
     if (!keyObj) return res.json({ status: 'error', message: 'Key not found.' });
     if (keyObj.for_who && keyObj.for_who !== FOR_WHO) return res.json({ status: 'error', message: 'Access denied.' });
-    keyObj.is_active = !keyObj.is_active;
-    await dbSaveKey(keyObj);
-    return res.json({ status: 'success', is_active: keyObj.is_active });
+
+    const newActive = !keyObj.is_active;
+    await dbUpdateKeyById(keyObj.id, { is_active: newActive });
+    return res.json({ status: 'success', is_active: newActive });
   } catch (err) {
     return res.json({ status: 'error', message: err.message });
   }
@@ -1194,9 +1264,9 @@ function renderDashboard(username, token) {
         <td style="font-size:11px;color:var(--text-muted);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="\${k.note||''}">\${k.note||'—'}</td>
         <td>
           <div style="display:flex;gap:4px;flex-wrap:wrap">
-            <button class="btn btn-xs btn-ghost" onclick="openEdit('\${k.key}')">✏️</button>
-            \${k.bound_hwid ? '<button class="btn btn-xs btn-warning" onclick="resetHwid(\\'' + k.key + '\\')">↺ HWID</button>' : ''}
-            <button class="btn btn-xs \${k.is_active ? 'btn-warning' : 'btn-success'}" onclick="toggleKey('\${k.key}')">\${k.is_active ? '⏸' : '▶'}</button>
+            <button class="btn btn-xs btn-ghost" onclick="openEdit(\${k.id != null ? k.id : 'null'}, '\${k.key}')">✏️</button>
+            \${k.bound_hwid ? '<button class="btn btn-xs btn-warning" onclick="resetHwid(' + (k.id != null ? k.id : 'null') + ', \\'' + k.key + '\\')">↺ HWID</button>' : ''}
+            <button class="btn btn-xs \${k.is_active ? 'btn-warning' : 'btn-success'}" onclick="toggleKey(\${k.id != null ? k.id : 'null'}, '\${k.key}')">\${k.is_active ? '⏸' : '▶'}</button>
             <button class="btn btn-xs btn-danger" onclick="deleteKey(\${k.id != null ? k.id : 'null'}, '\${k.key}')">✕</button>
           </div>
         </td>
@@ -1279,11 +1349,13 @@ function renderDashboard(username, token) {
   }
 
   // ── Edit Modal ──
-  function openEdit(key) {
-    const k = allKeys.find(x => x.key === key);
+  let currentEditKeyId = null;
+  function openEdit(id, key) {
+    const k = allKeys.find(x => (id != null && x.id === id) || x.key === key);
     if (!k) return;
+    currentEditKeyId = k.id != null ? k.id : null;
     document.getElementById('editKeyId').value = k.key;
-    document.getElementById('editKeyDisplay').value = k.key;
+    document.getElementById('editKeyDisplay').value = k.key + (k.id != null ? ' (ID: ' + k.id + ')' : '');
     document.getElementById('editDuration').value = k.duration_days;
     document.getElementById('editNote').value = k.note || '';
     document.getElementById('editExpiry').value = k.expires_at ? new Date(k.expires_at).toISOString().slice(0,16) : '';
@@ -1292,11 +1364,12 @@ function renderDashboard(username, token) {
 
   async function saveEdit() {
     const key = document.getElementById('editKeyId').value;
+    const id = currentEditKeyId;
     const duration_days = document.getElementById('editDuration').value;
     const note = document.getElementById('editNote').value;
     const expiry_raw = document.getElementById('editExpiry').value;
     const expires_at = expiry_raw ? new Date(expiry_raw).toISOString() : null;
-    const data = await api('/api/admin/edit', { key, duration_days, note, expires_at });
+    const data = await api('/api/admin/edit', { id, key, duration_days, note, expires_at });
     if (data.status === 'success') {
       showToast('Key updated!');
       closeModal('editModal');
@@ -1305,15 +1378,16 @@ function renderDashboard(username, token) {
   }
 
   // ── Actions ──
-  async function resetHwid(key) {
-    if (!confirm('Reset HWID for ' + key + '?')) return;
-    const data = await api('/api/admin/reset-hwid', { key });
+  async function resetHwid(id, key) {
+    const label = key || ('ID ' + id);
+    if (!confirm('Reset HWID for ' + label + '?')) return;
+    const data = await api('/api/admin/reset-hwid', { id, key });
     showToast(data.message, data.status === 'success');
     loadData();
   }
 
-  async function toggleKey(key) {
-    const data = await api('/api/admin/toggle', { key });
+  async function toggleKey(id, key) {
+    const data = await api('/api/admin/toggle', { id, key });
     showToast(data.is_active ? 'Key enabled' : 'Key disabled', true);
     loadData();
   }
