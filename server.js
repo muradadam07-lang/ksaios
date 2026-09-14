@@ -604,7 +604,7 @@ app.post('/api/admin/add-custom', authMiddleware, async (req, res) => {
     if (existing) {
       return res.json({ 
         status: 'error', 
-        message: `Key "${keyStr}" already exists in database (under for_who: ${existing.for_who || 'other'}). Duplicate key names cannot be reused.` 
+        message: 'can not create by this name.' 
       });
     }
 
