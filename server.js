@@ -181,49 +181,7 @@ async function dbDeleteExpired() {
   }
 }
 
-async function dbAddLog(logObj) {
-  try {
-    await fetch(`${SB_REST_URL}/logs`, {
-      method: 'POST',
-      headers: { ...sbHeaders },
-      body: JSON.stringify([{
-        timestamp: logObj.timestamp || new Date().toISOString(),
-        key: logObj.key,
-        hwid: logObj.hwid,
-        device: logObj.device,
-        status: logObj.status
-      }])
-    });
-  } catch (e) {
-    console.error('dbAddLog error:', e.message);
-  }
-}
 
-async function dbGetLogs(limit = 200) {
-  try {
-    const res = await fetch(`${SB_REST_URL}/logs?select=*&order=timestamp.desc&limit=${limit}`, {
-      headers: { ...sbHeaders }
-    });
-    if (res.ok) {
-      const data = await res.json();
-      return Array.isArray(data) ? data : [];
-    }
-  } catch (e) {
-    console.error('dbGetLogs error:', e.message);
-  }
-  return [];
-}
-
-async function dbClearLogs() {
-  const res = await fetch(`${SB_REST_URL}/logs?id=gt.0`, {
-    method: 'DELETE',
-    headers: { ...sbHeaders }
-  });
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Supabase clear logs error (${res.status}): ${errText}`);
-  }
-}
 
 // ─── Admin Session & User Authentication (100% Supabase) ──────────────────────
 const AUTH_SECRET = process.env.AUTH_SECRET || 'ksaios_supabase_admin_secret_token_2026';
@@ -482,13 +440,7 @@ app.post('/api/verify', async (req, res) => {
       expiryFormatted = `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
     }
 
-    await dbAddLog({
-      timestamp: new Date().toISOString(),
-      key: keyObj.key,
-      hwid: deviceHwid,
-      device: device_name || 'Unknown',
-      status: 'Success'
-    });
+
 
     return res.json({ 
       status: 'success', 
@@ -539,11 +491,10 @@ app.get('/api/status', async (req, res) => {
 // ADMIN API
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Stats + key list + logs
+// Stats + key list
 app.get('/api/admin/data', authMiddleware, async (req, res) => {
   try {
     const keys = await dbGetKeys();
-    const logs = await dbGetLogs(200);
     const total = keys.length;
     let active = 0, expired = 0, bound = 0;
     keys.forEach(k => {
@@ -551,7 +502,7 @@ app.get('/api/admin/data', authMiddleware, async (req, res) => {
       else active++;
       if (k.bound_hwid) bound++;
     });
-    return res.json({ status: 'success', stats: { total, active, expired, bound }, keys, logs });
+    return res.json({ status: 'success', stats: { total, active, expired, bound }, keys });
   } catch (err) {
     return res.json({ status: 'error', message: err.message });
   }
@@ -748,15 +699,7 @@ app.post('/api/admin/delete-expired', authMiddleware, async (req, res) => {
   }
 });
 
-// Clear logs
-app.post('/api/admin/clear-logs', authMiddleware, async (req, res) => {
-  try {
-    await dbClearLogs();
-    return res.json({ status: 'success', message: 'Logs cleared.' });
-  } catch (err) {
-    return res.json({ status: 'error', message: err.message });
-  }
-});
+
 
 // Change admin password in Supabase
 app.post('/api/admin/change-password', authMiddleware, async (req, res) => {
@@ -905,9 +848,7 @@ function renderDashboard(username, token) {
     .toast-ok  { background:#00e676; color:#111; }
     .toast-err { background:#ff3d71; color:#fff; }
 
-    /* ── Log table ── */
-    .log-entry-success { color:var(--success); }
-    .log-entry-error   { color:var(--danger); }
+
 
     /* ── Section divider ── */
     .section-divider { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
@@ -1001,7 +942,6 @@ function renderDashboard(username, token) {
     <button class="tab-btn active" onclick="switchTab('tab-keys',this)">🔑 License Keys</button>
     <button class="tab-btn" onclick="switchTab('tab-generate',this)">➕ Generate</button>
     <button class="tab-btn" onclick="switchTab('tab-custom',this)">✍️ Custom Key</button>
-    <button class="tab-btn" onclick="switchTab('tab-logs',this)">📋 Logs</button>
   </div>
 
   <!-- TAB: Keys -->
@@ -1128,29 +1068,7 @@ function renderDashboard(username, token) {
     </div>
   </div>
 
-  <!-- TAB: Logs -->
-  <div id="tab-logs" class="tab-content">
-    <div class="card">
-      <div class="section-divider">
-        <h3 style="margin:0">📋 Verification Logs</h3>
-        <button class="btn btn-danger btn-sm" onclick="clearLogs()">🗑 Clear All Logs</button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Key</th>
-              <th>Device</th>
-              <th>HWID</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody id="logsTableBody"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
+
 
 </div><!-- /container -->
 
@@ -1159,7 +1077,6 @@ function renderDashboard(username, token) {
 <script>
   let currentToken = '${token || ""}' || localStorage.getItem('flash_admin_token') || '';
   let allKeys = [];
-  let allLogs = [];
   let currentFilter = 'all';
   let lastGeneratedKeys = [];
 
@@ -1208,9 +1125,7 @@ function renderDashboard(username, token) {
     document.getElementById('statExpired').innerText = data.stats.expired;
 
     allKeys = data.keys;
-    allLogs = data.logs;
     renderTable();
-    renderLogs();
   }
 
   // ── Table rendering ──
@@ -1282,24 +1197,6 @@ function renderDashboard(username, token) {
     el.classList.add('active');
     currentFilter = el.dataset.filter;
     renderTable();
-  }
-
-  // ── Logs ──
-  function renderLogs() {
-    const tbody = document.getElementById('logsTableBody');
-    tbody.innerHTML = '';
-    allLogs.forEach(l => {
-      const tr = document.createElement('tr');
-      const t = new Date(l.timestamp);
-      tr.innerHTML = \`
-        <td style="font-size:11px;white-space:nowrap;color:var(--text-muted)">\${t.toLocaleDateString()} \${t.toLocaleTimeString()}</td>
-        <td><span class="key-badge">\${l.key}</span></td>
-        <td style="font-size:11px">\${l.device||'?'}</td>
-        <td class="hwid-badge" style="font-size:10px">\${l.hwid ? l.hwid.substring(0,14)+'...' : '—'}</td>
-        <td><span class="status-badge \${l.status==='Success'?'status-active':'status-expired'}">\${l.status}</span></td>
-      \`;
-      tbody.appendChild(tr);
-    });
   }
 
   // ── Tabs ──
@@ -1407,12 +1304,7 @@ function renderDashboard(username, token) {
     loadData();
   }
 
-  async function clearLogs() {
-    if (!confirm('Clear all verification logs?')) return;
-    const data = await api('/api/admin/clear-logs', {});
-    showToast(data.message, data.status === 'success');
-    loadData();
-  }
+
 
   // ── Change password ──
   async function changePassword() {
