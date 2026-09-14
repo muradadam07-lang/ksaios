@@ -604,7 +604,7 @@ app.post('/api/admin/add-custom', authMiddleware, async (req, res) => {
     if (existing) {
       return res.json({ 
         status: 'error', 
-        message: 'can not create by this name.' 
+        message: "Can't create the key by this name." 
       });
     }
 
