@@ -60,6 +60,22 @@ async function dbFindKey(keyStr) {
   return null;
 }
 
+async function dbFindKeyById(id) {
+  if (!id) return null;
+  try {
+    const res = await fetch(`${SB_REST_URL}/license_keys?id=eq.${encodeURIComponent(id)}&for_who=eq.${encodeURIComponent(FOR_WHO)}&limit=1`, {
+      headers: { ...sbHeaders }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) return data[0];
+    }
+  } catch (e) {
+    console.error('dbFindKeyById error:', e.message);
+  }
+  return null;
+}
+
 async function dbSaveKey(keyObj) {
   const res = await fetch(`${SB_REST_URL}/license_keys`, {
     method: 'POST',
@@ -81,6 +97,18 @@ async function dbInsertKeys(newKeys) {
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(`Supabase insert error (${res.status}): ${errText}`);
+  }
+}
+
+async function dbDeleteKeyById(id) {
+  if (!id) throw new Error('Key ID is required for deletion');
+  const res = await fetch(`${SB_REST_URL}/license_keys?id=eq.${encodeURIComponent(id)}&for_who=eq.${encodeURIComponent(FOR_WHO)}`, {
+    method: 'DELETE',
+    headers: { ...sbHeaders }
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Supabase delete error (${res.status}): ${errText}`);
   }
 }
 
@@ -612,15 +640,29 @@ app.post('/api/admin/toggle', authMiddleware, async (req, res) => {
   }
 });
 
-// Delete key
+// Delete key (by ID)
 app.post('/api/admin/delete', authMiddleware, async (req, res) => {
   try {
-    const { key } = req.body;
-    const keyObj = await dbFindKey(key);
+    const { id, key } = req.body;
+    let keyObj = null;
+
+    if (id !== undefined && id !== null && String(id).trim() !== '') {
+      keyObj = await dbFindKeyById(id);
+    } else if (key) {
+      keyObj = await dbFindKey(key);
+    }
+
     if (!keyObj) return res.json({ status: 'error', message: 'Key not found.' });
     if (keyObj.for_who && keyObj.for_who !== FOR_WHO) return res.json({ status: 'error', message: 'Access denied.' });
-    await dbDeleteKey(key);
-    return res.json({ status: 'success', message: 'Key deleted.' });
+
+    const keyId = keyObj.id;
+    if (keyId !== undefined && keyId !== null) {
+      await dbDeleteKeyById(keyId);
+    } else {
+      await dbDeleteKey(keyObj.key);
+    }
+
+    return res.json({ status: 'success', message: `Key ${keyObj.key} (ID: ${keyId || 'N/A'}) deleted.` });
   } catch (err) {
     return res.json({ status: 'error', message: err.message });
   }
@@ -1155,7 +1197,7 @@ function renderDashboard(username, token) {
             <button class="btn btn-xs btn-ghost" onclick="openEdit('\${k.key}')">✏️</button>
             \${k.bound_hwid ? '<button class="btn btn-xs btn-warning" onclick="resetHwid(\\'' + k.key + '\\')">↺ HWID</button>' : ''}
             <button class="btn btn-xs \${k.is_active ? 'btn-warning' : 'btn-success'}" onclick="toggleKey('\${k.key}')">\${k.is_active ? '⏸' : '▶'}</button>
-            <button class="btn btn-xs btn-danger" onclick="deleteKey('\${k.key}')">✕</button>
+            <button class="btn btn-xs btn-danger" onclick="deleteKey(\${k.id != null ? k.id : 'null'}, '\${k.key}')">✕</button>
           </div>
         </td>
       \`;
@@ -1276,9 +1318,10 @@ function renderDashboard(username, token) {
     loadData();
   }
 
-  async function deleteKey(key) {
-    if (!confirm('Delete key ' + key + '?')) return;
-    const data = await api('/api/admin/delete', { key });
+  async function deleteKey(id, key) {
+    const label = key || ('ID ' + id);
+    if (!confirm('Delete key ' + label + '?')) return;
+    const data = await api('/api/admin/delete', { id, key });
     showToast(data.message, data.status === 'success');
     loadData();
   }
